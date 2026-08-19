@@ -52,9 +52,9 @@ pinout:
 
   # Bidirectional pins
   uio[0]: "Pmod CS0 (flash select - IMEM)"
-  uio[1]: "Pmod SD0 (MOSI, shared flash/PSRAM)"
-  uio[2]: "Pmod SD1 (MISO, shared flash/PSRAM)"
-  uio[3]: "Pmod SCK (shared flash/PSRAM)"
+  uio[1]: "Pmod SD0 (MOSI, shared flash/PSRAM/SPI)"
+  uio[2]: "Pmod SD1 (MISO, shared flash/PSRAM/SPI)"
+  uio[3]: "Pmod SCK (shared flash/PSRAM/SPI)"
   uio[4]: "Pmod SD2 (held high, unused)"
   uio[5]: "Pmod SD3 (held high, unused)"
   uio[6]: "Pmod CS1 (RAM A CS) - unused when STRAP selects RAM B"
