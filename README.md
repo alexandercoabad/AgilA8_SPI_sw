@@ -4,7 +4,7 @@
 Agila is Tagalog for "eagle" - specifically evoking the Philippine Eagle (Haribon), the country's national bird. AgilA8 pairs that with A8, the name of the CPU core at the center of the design: Agil + A8 = AgilA8, the two overlapping on a shared capital A.
 
 ## Layout 
-<img width="471" height="643" alt="Screenshot 2026-08-19 at 6 35 25 AM" src="https://github.com/user-attachments/assets/311f9214-8b5d-435b-8a26-f53cb2e36b4e" />
+<img width="471" height="643" alt="Screenshot 2026-08-19 at 6 35 25 AM" src="https://github.com/user-attachments/assets/311f9214-8b5d-435b-8a26-f53cb2e36b4e" />
 
 3D Viewer: https://gds-viewer.tinytapeout.com/?model=https://alexandercoabad.github.io/AgilA8/tinytapeout.oas&pdk=sky130A
 
@@ -30,20 +30,11 @@ hardware to verify against.
 
 A third front-end, a general-purpose SPI master intended for driving an
 external device (an LCD, an ADC, another MCU), shares the same physical
-lines using CS2. **This requires one board modification first**: on the
-stock QSPI Pmod, CS2 ("RAM B") is wired directly to a second, populated
-PSRAM chip, not out to any external connector pin. Per the Pmod's own
-documentation ([mole99/qspi-pmod](https://github.com/mole99/qspi-pmod)),
-each of its three chip-select traces can be cut on the back of the
-board - doing so for CS2 disables that second PSRAM chip (a 1k pull-up
-holds its `/CS` disabled) and makes the pad available via a through-hole
-header pin as a plain input or output. That's a documented, intended
-modification on the board as sold, not a custom respin - and it leaves
-flash (CS0) and RAM A (CS1) untouched, so IMEM/DMEM are unaffected.
-Until that trace is cut, this peripheral is functionally inert: CS2
-still selects the live RAM B chip, so its transfers just talk to that
-PSRAM with the wrong command protocol rather than reaching any external
-device. See `spi_ctrl.v`'s header for the full explanation.
+lines using CS2. **On the stock QSPI Pmod, CS2 ("RAM B") is wired
+directly to a second, populated PSRAM chip**, not out to any external
+connector pin - so this peripheral needs one of two fixes before it can
+reach anything external. See "RAM A/B mode select" below for both, and
+which one this design actually implements in hardware today.
 
 All three front-ends (flash, PSRAM, and the general-purpose SPI
 controller) are driven by one shared SPI shift engine rather than three
@@ -59,24 +50,74 @@ address decode, the shared engine can grant flash/PSRAM/SPI with a
 simple fixed-priority mux rather than needing real bus arbitration -
 by construction, at most one of the three is ever requesting at once.
 
+### RAM A/B mode select
+
+The general-purpose SPI controller's CS2 conflict with the Pmod's
+second PSRAM chip has two real fixes:
+
+1. **Cut the CS2 trace on the Pmod's PCB** (documented directly in the
+   Pmod's own repo, [mole99/qspi-pmod](https://github.com/mole99/qspi-pmod)):
+   permanently disables that PSRAM chip, frees the pin for the SPI
+   controller. Simple, but irreversible on that specific board - RAM B
+   is gone for good once cut.
+2. **An external SPDT switch, wired to both CS2 itself and to `ui_in[7]`**
+   - what this design actually implements. One pole of the switch
+   routes the Pmod's CS2 pad to *either* the RAM B chip *or* an external
+   device header pin; the other pole (moving with the same physical
+   throw) feeds `ui_in[7]`, so the RTL always knows which position the
+   switch is in. This is reversible - flip the switch, get the other
+   mode - at the cost of losing one general-purpose GPIO input bit and
+   a small amount of extra logic to sample it.
+
+`ui_in[7]` is sampled exactly once, ~15 clock cycles after `rst_n`
+releases (long enough for a freshly-flipped mechanical switch, or a pin
+still settling out of reset, to be trustworthy), latched into a
+**STRAP** register, and held constant for the rest of that power-on
+session - it is not a live, continuously-read mode switch. The result
+is exposed read-only at `STRAP` (`0xF5`, see address map below).
+
+- **STRAP = 0 (default):** CS1 carries RAM A traffic normally; CS2
+  carries the general-purpose SPI controller's traffic - only correct
+  if the switch's other pole is *also* thrown to connect CS2 to the
+  external device header at the same time, not to RAM B.
+- **STRAP = 1 (RAM-B mode):** *all* DMEM PSRAM traffic reroutes from
+  CS1 to CS2 instead - RAM A is completely unused in this mode, and
+  DMEM is backed by the RAM B chip instead. The general-purpose SPI
+  controller is disabled: any firmware write to `SPI_DATA` in this mode
+  completes immediately as a safe no-op (`SPI_READY` still pulses, so
+  nothing hangs) rather than ever driving CS2 with SPI command bytes
+  while real RAM-B traffic also needs that same pin - which would
+  otherwise corrupt live DMEM contents.
+
+Because `ui_in[7]` is also one of the 8 bits GPIO_IN normally exposes,
+dedicating it to this strap isn't a one-time cost - it permanently
+shrinks general-purpose GPIO input from 8 usable bits to 7. `GPIO_IN`
+bit 7 will simply always read back the same value as `STRAP`.
+
+**Important:** the two poles of the switch have to physically agree -
+nothing in this design can detect or correct a switch wired backwards
+(CS2 pointing at RAM B while `ui_in[7]` reads 0, or vice versa). Get
+that wrong and RAM-B-mode DMEM traffic would go out to nothing (CS1
+silent, CS2 not actually connected to RAM B), or default-mode SPI
+traffic would corrupt live RAM B contents instead of reaching an
+external device - verify the wiring matches before relying on either
+mode.
+
 ### Address map
 
-| Address range | Device                                  |
-| -------------- | --------------------------------------- |
-| 0x00 - 0xEF, 0xF5 - 0xF7 | RAM (external PSRAM, RAM A)   |
-| 0xF0 - 0xF2    | GPIO                                    |
-| 0xF3 - 0xF4    | SPI (general-purpose - requires a board mod, see below) |
-| 0xF8 - 0xFB    | Timer                                   |
-| 0xFC - 0xFD    | PWM                                     |
+| Address range            | Device                                                          |
+| ------------------------ | ------------------------------------------------------------------|
+| 0x00 - 0xEF, 0xF6 - 0xF7 | RAM (external PSRAM - RAM A in default mode, RAM B in STRAP=1 mode) |
+| 0xF0 - 0xF2              | GPIO                                                             |
+| 0xF3 - 0xF4              | SPI (general-purpose - default mode only, see "RAM A/B mode select") |
+| 0xF5                     | STRAP (R) - RAM A/B mode select readback, see above              |
+| 0xF8 - 0xFB              | Timer                                                            |
+| 0xFC - 0xFD              | PWM                                                              |
 
 > **Note:** `0xF3`/`0xF4` used to be plain RAM in earlier revisions of
-> this design. They now belong to the general-purpose SPI controller
-> (see below) - any program that stored ordinary data at those two
-> addresses will now silently hit the SPI controller instead of RAM.
-> That controller only reaches an external device once the QSPI Pmod's
-> RAM B chip-select trace has been cut (see "How it works" below) - on
-> an unmodified board, writes there are functional but only reach the
-> still-populated internal PSRAM chip, not anything external.
+> this design; `0xF5` was too, until the STRAP register claimed it.
+> Any program that stored ordinary data at those three addresses will
+> now silently hit the SPI controller or STRAP instead of RAM.
 
 Instructions are fetched separately, as two consecutive bytes from
 external flash (big-endian: high byte at PC, low byte at PC+1) - flash
@@ -92,8 +133,8 @@ isn't part of the 8-bit DMEM address space above.
 | 3 | GPIO in 3   | GPIO out 3   | SCK (shared flash/PSRAM)          |
 | 4 | GPIO in 4   | GPIO out 4   | SD2 (held high, unused)           |
 | 5 | GPIO in 5   | GPIO out 5   | SD3 (held high, unused)           |
-| 6 | GPIO in 6   | GPIO out 6   | RAM A CS (CS1)                    |
-| 7 | GPIO in 7   | PWM output   | SPI CS (CS2, general-purpose SPI - requires cutting the RAM B trace first, see below) |
+| 6 | GPIO in 6   | GPIO out 6   | RAM A CS (CS1) - unused in STRAP=1 mode |
+| 7 | GPIO in 7 (also feeds STRAP, see above) | PWM output | RAM B CS / general SPI CS (CS2) - which one depends on STRAP |
 
 
 #### GPIO
@@ -101,45 +142,30 @@ isn't part of the 8-bit DMEM address space above.
 | Register | Address     | Description                                                      |
 | -------- | ----------- | ------------------------------------------------------------------ |
 | GPIO_OUT | 0xF0 (R/W)  | Write sets `uo_out[6:0]`; read returns the last value written    |
-| GPIO_IN  | 0xF1 (R)    | Reads the current state of `ui_in[7:0]`                          |
+| GPIO_IN  | 0xF1 (R)    | Reads the current state of `ui_in[7:0]`. **Bit 7 is shared with the STRAP sample** - see "RAM A/B mode select" above; it always reads the same value as `STRAP`, not an independent signal |
 | GPIO_DIR | 0xF2 (R/W)  | Read/write register; not wired to anything (`ui_in`/`uo_out` are fixed-direction TT pins, so there's no direction to control) |
 
 `uo_out[7]` is dedicated to the PWM output, not GPIO - a write of
 `0xAA` to GPIO_OUT reads back as `0xAA` internally, but only
 `uo_out[6:0]` (`0x2A` in that example) reaches a physical pin.
 
-#### SPI (general-purpose) - requires a board modification first
+#### SPI (general-purpose) - default mode only
 
 This peripheral's register interface (`SPI_DATA`/`SPI_CTRL` below) is
-correct SPI-master logic, but **it needs one physical modification to
-the QSPI Pmod before it can reach anything external**. On the stock
-board, CS2 ("RAM B") is wired directly to a second, populated PSRAM
-chip - using this peripheral as-is just sends SPI traffic to that real
-PSRAM using the wrong command set, and reaches no external device.
-
-Per the Pmod's own documentation
-([mole99/qspi-pmod](https://github.com/mole99/qspi-pmod)): each of the
-three chip-select traces on the board can be cut, on the back of the
-PCB, to disable that chip - a 1k pull-up then holds its `/CS` disabled,
-and the pad becomes available via a through-hole header pin as a plain
-input or output. Cutting **CS2's** trace specifically disables RAM B
-and frees exactly the pin this peripheral needs - flash (CS0) and RAM A
-(CS1) are untouched, so IMEM/DMEM keep working normally. This is a
-documented, intended modification on the board as sold, not a custom
-PCB respin.
-
-Until that cut is made, treat this peripheral as inert. If you don't
-want to modify the board (or just want the simplest path for something
-like an e-paper display, which is slow enough that bit-banging is a
-non-issue), drive the external device over the GPIO pins in software
-instead - `uo_out[6:0]` and `ui_in[7:0]` are on a separate header from
-the QSPI Pmod's `uio` bus entirely, so they aren't affected by any of
-the above either way.
+correct SPI-master logic, but it only reaches an external device when
+**STRAP reads 0** (default mode) - see "RAM A/B mode select" above for
+what that depends on and what happens in the other mode. If you'd
+rather not deal with the switch/strap mechanism at all, cutting the
+Pmod's CS2 trace (also described above) is a simpler, permanent
+alternative that makes default mode the *only* mode, with no strap
+logic or GPIO_IN cost.
 
 | Register | Address     | Description                                                        |
 | -------- | ----------- | -------------------------------------------------------------------- |
-| SPI_DATA | 0xF3 (R/W)  | Write: shifts the byte out (CS auto-asserted for the transfer, **blocking** until the 8-bit transfer physically completes). Read: returns the byte simultaneously shifted in from MISO during the most recent transfer, without starting a new one - to read a byte from a slave, write a dummy `0x00` and then read DATA back (standard full-duplex SPI) |
+| SPI_DATA | 0xF3 (R/W)  | Write: shifts the byte out (CS auto-asserted for the transfer, **blocking** until the 8-bit transfer physically completes). In RAM-B mode (STRAP=1), completes immediately as a safe no-op instead - see above. Read: returns the byte simultaneously shifted in from MISO during the most recent transfer, without starting a new one - to read a byte from a slave, write a dummy `0x00` and then read DATA back (standard full-duplex SPI) |
 | SPI_CTRL | 0xF4 (R/W)  | Bits[1:0] = SCK clock divider: `00` = fastest (~sys_clk/2, matches flash/PSRAM speed), `01` = ~sys_clk/8, `10` = ~sys_clk/32, `11` = ~sys_clk/128 (**reset default** - start slow, let software speed up once the attached device's timing is known to tolerate it) |
+
+Mode 0 (CPOL=0, CPHA=0), MSB-first, full-duplex.
 
 Each `SPI_DATA` write is deliberately blocking rather than
 fire-and-forget: the core has no instruction cache, so the very next
@@ -172,18 +198,25 @@ correctly ignores it.
 
 ## How to test
 
-1. Program the test image onto the Pmod's flash chip (`test/imem.hex`,
-   built by `test/build_prog.py` - exercises every opcode plus the GPIO,
-   timer, and PWM registers) and leave the PSRAM chip's contents as-is;
-   the program initializes any RAM it depends on.
-2. Reset the design (`rst_n` low then high).
-3. Run the clock. The CPU fetches from flash and reads/writes RAM over
+1. Decide which mode you need (see "RAM A/B mode select" above) and
+   make sure the switch/strap wiring (or the CS2 trace cut, if using
+   that fix instead) matches before relying on either RAM B or the SPI
+   controller.
+2. Program the test image onto the Pmod's flash chip and leave the
+   PSRAM chip's contents as-is; the program initializes any RAM it
+   depends on.
+3. Reset the design (`rst_n` low then high) - if using the switch,
+   make sure it's in its final position *before* releasing reset, so
+   the STRAP sample settles on the intended value.
+4. Run the clock. The CPU fetches from flash and reads/writes RAM over
    the shared SPI bus automatically - no host intervention needed once
    running.
-4. Check final state against the golden reference model
-   (`test/golden.py`) - `test/TESTING.md` and `test/TESTING_round2.md`
-   document the expected register values, and the pipeline this was
-   last verified against.
+
+This repository has a `test/` directory, but I haven't independently
+verified its current contents match every detail described in this
+README (in particular, whether it exercises both STRAP modes, not just
+default mode) - worth checking directly rather than assuming from this
+doc alone.
 
 Before committing to a tapeout, the QSPI Pmod flash-read timing margin
 (`read_delay_cfg`, now handled centrally in `qspi_shared_engine.v`) is
@@ -194,19 +227,22 @@ Tiny Tapeout FPGA Development Kit + QSPI Pmod path used for that.
 ## External hardware
 
 - [Tiny Tapeout QSPI Pmod](https://store.tinytapeout.com/products/QSPI-Pmod-p716541602),
-  plugged into the demoboard's bidirectional Pmod header. The flash chip
-  (program memory) and one of the two PSRAM chips (RAM A, data memory)
-  are used as designed. The second PSRAM chip (RAM B / CS2) needs its
-  chip-select trace cut on the back of the Pmod PCB (documented,
-  intended modification - see
-  [mole99/qspi-pmod](https://github.com/mole99/qspi-pmod)) before the
-  general-purpose SPI peripheral can drive an external device through
-  it; on an unmodified board that peripheral just talks to the
-  still-populated RAM B chip instead of anything external.
-- Without that modification, drive an external SPI device (e.g. an
-  e-paper display) over the separate `ui_in`/`uo_out` GPIO header
-  instead, bit-banging the protocol in software - that header is
-  independent of the QSPI Pmod's `uio` bus and works either way.
+  plugged into the demoboard's bidirectional Pmod header. Flash (program
+  memory) is used as designed regardless of mode.
+- An external SPDT switch (see "RAM A/B mode select" above), wired so
+  one pole routes the Pmod's CS2 pad between the onboard RAM B chip and
+  an external device header pin, and the other pole feeds `ui_in[7]` so
+  the RTL can tell which position it's in. Get the two poles wired
+  backwards relative to each other and neither mode works correctly -
+  double check against "RAM A/B mode select" above before trusting
+  either one.
+- Alternatively, permanently cut the Pmod's CS2 trace (see above) if
+  you only ever want the SPI controller and don't need RAM B or the
+  switch/strap mechanism at all.
+- Without either fix in place, drive an external SPI device over the
+  separate `ui_in`/`uo_out` GPIO header instead, bit-banging the
+  protocol in software - that header is independent of the QSPI Pmod's
+  `uio` bus and works regardless of STRAP.
 - Tiny Tapeout demoboard, or the
   [FPGA Development Kit](https://store.tinytapeout.com/products/FPGA-Development-Kit-p813805747)
   for pre-tapeout bring-up on real silicon-adjacent hardware.
@@ -215,7 +251,7 @@ Tiny Tapeout FPGA Development Kit + QSPI Pmod path used for that.
 # Acknowledgments & Attribution
 
 This file documents the open-source tools, process design kit, and prior
-art that AbadMCU depends on or was inspired by. It's split into two
+art that AgilA8 depends on or was inspired by. It's split into two
 categories that are easy to conflate but legally distinct:
 
 1. **Tools and IP actually incorporated into this design** - their
@@ -224,7 +260,7 @@ categories that are easy to conflate but legally distinct:
    copied from these; crediting them is good academic/community
    practice, not a license requirement, since taking inspiration from
    a *design pattern* (as opposed to copying source text) isn't a
-   Copyright event.
+   copyright event.
 
 ---
 
@@ -233,20 +269,20 @@ categories that are easy to conflate but legally distinct:
 The physical chip (GDS) produced from this repository directly embeds
 standard-cell layouts from, and was built using, the following
 Apache-2.0-licensed projects. Their copyright notices are reproduced
-below per Apache-2.0 \u00a74; none of them ship a separate `NOTICE` file as
+below per Apache-2.0 §4; none of them ship a separate `NOTICE` file as
 of this writing (checked: skywater-pdk's repository root contains only
 `LICENSE` and `AUTHORS`, no `NOTICE` - worth re-checking the others
 listed here yourself before a formal release, since this wasn't
-exhaustively verified for every entry.
+exhaustively verified for every entry).
 
 ### SkyWater SKY130 PDK
-The standard-cell library design was synthesized and hardened
+The standard-cell library this design was synthesized and hardened
 against.
 
 ```
 Copyright 2020 SkyWater PDK Authors
 Licensed under the Apache License, Version 2.0 (the "License");
-may not use this file except in compliance with the License.
+you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
@@ -264,7 +300,7 @@ The RTL-to-GDS tool flow (synthesis, place & route, STA, DRC/LVS) that
 produced this design's GDS.
 
 ```
-OpenLane is \u00a92020-2024 Efabless Corporation and is available under
+OpenLane is ©2020-2024 Efabless Corporation and is available under
 the Apache License, version 2.0.
 ```
 Source: https://github.com/The-OpenROAD-Project/OpenLane
@@ -287,7 +323,7 @@ default per Tiny Tapeout's own FAQ)
 
 AgilA8's central design decision - CPU with no on-chip memory,
 program fetched from external QSPI flash, working data in external
-QSPI PSRAM, sharing physical SPI wires between them via a separate chip
+QSPI PSRAM, sharing physical SPI wires between them via separate chip
 selects - follows the same strategic pattern pioneered on Tiny Tapeout
 by the following projects. **No RTL, ISA encoding, or source code from
 either project was copied** - AgilA8's CPU core, instruction set, and
@@ -318,10 +354,10 @@ at the time this was written)
 A8's `r0`-hardwired-to-zero convention and load/store architectural
 style are modeled on RISC-V's design philosophy. RISC-V is an open,
 freely usable ISA specification; no code is reused here, so this
-carries no license obligation. **TT8 is not RISC-V-compliant** - it's
-a custom 16-bit-instruction, 8-bit-datapath ISA in the RISC-V style,
-and should not be described as a RISC-V implementation or use the
-RISC-V trademark/logo.
+carries no license obligation. **A8 is not RISC-V-compliant** - it's a
+custom 16-bit-instruction, 8-bit-datapath ISA in the RISC-V style, and
+should not be described as a RISC-V implementation or use the RISC-V
+trademark/logo.
 
 ---
 
@@ -336,10 +372,12 @@ RISC-V trademark/logo.
   this project. `qspi_shared_engine.v` consolidates what were
   previously three separate controllers (`qspi_flash_reader.v` for
   flash, `qspi_psram_ctrl.v` for PSRAM, and `spi_ctrl.v` for the
-  general-purpose SPI peripheral) into one shared engine - see that
-  file's header for why, and `spi_ctrl.v`'s own header/testbench for
-  the general-purpose SPI register semantics it still documents even
-  though it isn't the module instantiated in the final design.
+  general-purpose SPI peripheral) into one shared engine, and now also
+  implements the STRAP-driven RAM A/B mode select described above -
+  see that file's header for why, and `spi_ctrl.v`'s own
+  header/testbench for the general-purpose SPI register semantics it
+  still documents even though it isn't the module instantiated in the
+  final design.
 - The verification suite, bug fixes, and STA signoff analysis
   documented in this repository's history are this project's own work.
 
@@ -359,5 +397,9 @@ RISC-V trademark/logo.
   skywater-pdk; confirm the other three Apache-2.0 entries (open_pdks,
   OpenLane, Tiny Tapeout templates) don't ship their own NOTICE files
   before finalizing this document, since if any of them do, its
-  contents would need to be reproduced here per \u00a74(d).
-
+  contents would need to be reproduced here per §4(d).
+- This README's "How to test" section notes a `test/` directory exists
+  in the repo, but its exact contents (and whether it covers both STRAP
+  modes) weren't independently confirmed while writing this update -
+  GitHub blocked automated access to list that directory's files
+  directly.
