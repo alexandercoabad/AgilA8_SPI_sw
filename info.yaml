@@ -38,7 +38,7 @@ pinout:
   ui[4]: "gpio_in[4]"
   ui[5]: "gpio_in[5]"
   ui[6]: "gpio_in[6]"
-  ui[7]: "gpio_in[7]"
+  ui[7]: "gpio_in[7] / STRAP (RAM A+SPI vs RAM B select, sampled once ~15 cycles after reset - see README)"
 
   # Outputs
   uo[0]: "gpio_out[0]"
@@ -57,8 +57,8 @@ pinout:
   uio[3]: "Pmod SCK (shared flash/PSRAM)"
   uio[4]: "Pmod SD2 (held high, unused)"
   uio[5]: "Pmod SD3 (held high, unused)"
-  uio[6]: "Pmod CS1 (RAM A CS) "
-  uio[7]: "Pmod CS2 SPI CS (general-purpose SPI)"
+  uio[6]: "Pmod CS1 (RAM A CS) - unused when STRAP selects RAM B"
+  uio[7]: "Pmod CS2 - RAM B CS or general-purpose SPI CS, selected by STRAP (ui[7]) - see README"
 
 # Do not change!
 yaml_version: 6
